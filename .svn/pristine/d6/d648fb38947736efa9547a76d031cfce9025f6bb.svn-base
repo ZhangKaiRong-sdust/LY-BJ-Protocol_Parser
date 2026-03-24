@@ -1,0 +1,28 @@
+# -*- coding: utf-8 -*-
+# 设备状态数据单元解析
+
+# 数据: 04 32 99 00 00 00 00
+data = [0x04, 0x32, 0x99, 0x00, 0x00, 0x00, 0x00]
+
+print('=== 设备状态数据单元解析 (表D.27) ===')
+print(f'原始数据: {" ".join(f"{b:02X}" for b in data)}')
+print()
+
+# 电池电量: 2字节 BCD, 低字节在前
+battery_voltage = (data[1] << 8) | data[0]
+voltage_int = (battery_voltage >> 8) & 0xFF
+voltage_dec = battery_voltage & 0xFF
+print(f'电池电量: {voltage_int:02d}.{voltage_dec:02d} V')
+
+# 电量百分比: 1字节 BCD  
+battery_percent = data[2]
+percent_high = (battery_percent >> 4) & 0x0F
+percent_low = battery_percent & 0x0F
+if percent_high <= 9 and percent_low <= 9:
+    print(f'电量百分比: {percent_high*10 + percent_low}%')
+else:
+    print(f'电量百分比: {battery_percent:02X}H (无效BCD码)')
+
+# 预留: 4字节
+reserved = bytes(data[3:7])
+print(f'预留: {reserved.hex().upper()}')

@@ -1,0 +1,421 @@
+# -*- coding: utf-8 -*-
+"""
+背夹通信协议解析工具 - 核心解析模块
+Protocol: Q/GDW XXXXX-2022 附录D
+
+帧格式: 97H | TYPE | ADDR(9) | LL | SEQ | C | Fn(2) | DATA | CS | END
+固定部分: 18字节 (到DATA结束), CS=下1字节, END=最后1字节
+CS = sum(所有字节从0到DATA结束)
+"""
+
+import re
+from typing import Dict, Tuple, Optional, Any
+
+# ============ 定义 ============
+TYPE_MAP = {
+    0x00: "RFID北斗模块", 0x01: "RS485", 0x02: "保留", 0x03: "保留",
+    0x04: "热点", 0x05: "SIM卡", 0x06: "高频RFID", 0x07: "计量通信认证模块", 0xFF: "广播"
+}
+
+F0_MAP = {
+    0x01: "查询通用参数", 0x0F: "在线升级", 0xB0: "背夹功能",
+    0x20: "超高频RFID", 0xC0: "北斗模块"
+}
+
+# 表D.6 - 查询通用参数功能码 F1 定义
+F1_QUERY_GENERAL_MAP = {
+    0x01: "保留", 0x02: "设备状态", 0x03: "保留",
+    0xFF: "无效"
+}
+
+F1_BACKCLIP_MAP = {
+    0x01: "获取背夹信息", 0x02: "设置背夹自动关闭时间", 0x03: "获取模块电源状态",
+    0x04: "模块电源开启关闭", 0x05: "获取模块通讯参数", 0x06: "设置模块通讯参数",
+    0x07: "模块数据转发", 0x08: "设置开机后高级功能启动状态", 0x09: "获取开机后高级功能启动状态",
+    0x19: "获取蓝牙配对PIN码", 0x20: "SM4获取业务状态与设备指纹", 0x21: "SM4密钥协商开始",
+    0x22: "SM4密钥协商结束", 0x23: "SM4密钥下发",
+    0x30: "SIM卡通信参数设置", 0x31: "SIM卡通信参数读取", 0x32: "查询SIM卡连接状态",
+    0x33: "配置热点参数", 0x34: "获取热点参数", 0x35: "设置热点启动关闭",
+    0x36: "获取热点状态", 0x37: "设置充电启动关闭", 0x38: "设置移动硬盘功能启动关闭",
+}
+
+ERR_CODE_MAP = {
+    0x01: "设置参数失败", 0x03: "模块关闭失败", 0x04: "模块写入失败",
+    0x05: "模块读取失败", 0x06: "硬件模块与数据类型不匹配", 0x07: "接收数据超时",
+    0x08: "APN卡参数未设置", 0x0A: "网络注册失败",
+    0xB0: "失败", 0xF0: "参数非法", 0xF1: "失败", 0xFA: "无此功能",
+    0xFB: "参数非法", 0xFC: "通信超时",
+}
+
+# ============ 工具函数 ============
+def decode_control(c: int) -> Dict[str, Any]:
+    """解码控制域"""
+    d7 = (c >> 7) & 0x01
+    d6 = (c >> 6) & 0x01
+    d5 = (c >> 5) & 0x01
+    d4 = (c >> 4) & 0x01
+    d3 = (c >> 3) & 0x01
+    return {
+        "raw": f"{c:02X}H",
+        "dir": "上行" if d7 == 1 else "下行",
+        "prm": "启动站" if d6 == 1 else "从动站",
+        "encrypted": bool(d5),
+        "follow_up": bool(d4),
+        "is_error": (d7 == 1 and d3 == 1),
+    }
+
+def get_fn_name(f0: int, f1: int) -> str:
+    """获取Fn功能名称"""
+    f0_name = F0_MAP.get(f0, f"未知F0(0x{f0:02X})")
+    if f0 == 0x01:
+        # 查询通用参数 (表D.6)
+        f1_name = F1_QUERY_GENERAL_MAP.get(f1, f"未知F1(0x{f1:02X})")
+        return f"{f0_name} / {f1_name}"
+    elif f0 == 0xB0:
+        f1_name = F1_BACKCLIP_MAP.get(f1, f"未知F1(0x{f1:02X})")
+        return f"{f0_name} / {f1_name}"
+    return f0_name
+
+
+def bcd_to_decimal(bcd_byte: int) -> int:
+    """BCD码转十进制: 0x04→4, 0x32→32, 0x99→99
+    BCD: 每4位为一个十进制数, 如0x22→22, 0x06→6, 0x99→99
+    """
+    high = (bcd_byte >> 4) & 0x0F  # 高4位
+    low = bcd_byte & 0x0F           # 低4位
+    if high > 9 or low > 9:
+        return bcd_byte  # 非BCD码直接返回原值
+    return high * 10 + low
+
+
+def parse_data_unit(f0: int, f1: int, data: bytes) -> Dict[str, Any]:
+    """解析数据单元 - 根据Fn功能码解析不同格式"""
+    if f0 == 0x01 and f1 == 0x02:
+        # 设备状态 (表D.27)
+        return parse_device_status(data)
+    elif f0 == 0xB0 and f1 == 0x01:
+        # 获取背夹信息 (表D.20)
+        return parse_backclip_info(data)
+    return {"raw": " ".join(f"{b:02X}" for b in data)}
+
+
+def parse_device_status(data: bytes) -> Dict[str, Any]:
+    """解析设备状态数据单元 (表D.27)
+    
+    格式:
+    - 电池电量: 2字节 BCD (低字节在前, 单位: V)
+    - 电量百分比: 1字节 BCD (单位: %)
+    - 预留: 4字节
+    """
+    if len(data) < 7:
+        return {"raw": " ".join(f"{b:02X}" for b in data), "error": "数据长度不足"}
+    
+    # 电池电量: 2字节 BCD
+    v_low = bcd_to_decimal(data[0])
+    v_high = bcd_to_decimal(data[1])
+    voltage = v_low + v_high / 100
+    
+    # 电量百分比: 1字节 BCD
+    percent = bcd_to_decimal(data[2])
+    
+    # 预留: 4字节
+    reserved = data[3:7].hex().upper()
+    
+    return {
+        "电池电量": f"{voltage:.2f} V",
+        "电量百分比": f"{percent}%",
+        "预留": reserved
+    }
+
+
+def parse_backclip_info(data: bytes) -> Dict[str, Any]:
+    """解析获取背夹信息数据单元 (表D.20)
+    
+    格式:
+    - 设备型号: ASCII, 12字节
+    - 设备ID号: HEX, 6字节 (设备地址)
+    - 硬件版本号: BCD, 2字节 (NN.NN)
+    - 硬件版本日期: BCD, 3字节 (YYMMDD)
+    - 软件版本号: BCD, 4字节 (NN.NN.NN.NN)
+    - 软件版本日期: BCD, 3字节 (YYMMDD)
+    - 电池容量: BCD, 4字节 (单位: mAh)
+    - 支持的硬件模块信息: BIN, 4字节 (见设备类型TYPE定义)
+    - 背夹交互自动关闭时间: HEX, 2字节 (低字节在前, 单位: 分)
+    - 厂商编码: HEX, 24字节
+    - 厂家名称: GBK编码, 1+N (第一个字节表示长度)
+    """
+    if len(data) < 60:
+        return {"raw": " ".join(f"{b:02X}" for b in data), "error": "数据长度不足"}
+    
+    result = {}
+    pos = 0
+    
+    # 1. 设备型号: ASCII, 12字节
+    device_model = data[pos:pos+12].decode('ascii', errors='replace').strip('\x00 ')
+    result["设备型号"] = device_model
+    pos += 12
+    
+    # 2. 设备ID号: HEX, 6字节 (设备地址)
+    device_id = data[pos:pos+6].hex().upper()
+    result["设备ID号"] = device_id
+    pos += 6
+    
+    # 3. 硬件版本号: BCD, 2字节 (NN.NN)
+    hw_version_bytes = data[pos:pos+2]
+    major = bcd_to_decimal(hw_version_bytes[0])
+    minor = bcd_to_decimal(hw_version_bytes[1])
+    hw_version = f"{major:02d}.{minor:02d}"
+    result["硬件版本号"] = hw_version
+    pos += 2
+    
+    # 4. 硬件版本日期: BCD, 3字节 (YYMMDD)
+    hw_date_bytes = data[pos:pos+3]
+    yy = bcd_to_decimal(hw_date_bytes[0])
+    mm = bcd_to_decimal(hw_date_bytes[1])
+    dd = bcd_to_decimal(hw_date_bytes[2])
+    hw_date = f"20{yy:02d}-{mm:02d}-{dd:02d}"
+    result["硬件版本日期"] = hw_date
+    pos += 3
+    
+    # 5. 软件版本号: BCD, 4字节 (NN.NN.NN.NN)
+    sw_version_bytes = data[pos:pos+4]
+    v1 = bcd_to_decimal(sw_version_bytes[0])
+    v2 = bcd_to_decimal(sw_version_bytes[1])
+    v3 = bcd_to_decimal(sw_version_bytes[2])
+    v4 = bcd_to_decimal(sw_version_bytes[3])
+    sw_version = f"{v1:02d}.{v2:02d}.{v3:02d}.{v4:02d}"
+    result["软件版本号"] = sw_version
+    pos += 4
+    
+    # 6. 软件版本日期: BCD, 3字节 (YYMMDD)
+    sw_date_bytes = data[pos:pos+3]
+    yy = bcd_to_decimal(sw_date_bytes[0])
+    mm = bcd_to_decimal(sw_date_bytes[1])
+    dd = bcd_to_decimal(sw_date_bytes[2])
+    sw_date = f"20{yy:02d}-{mm:02d}-{dd:02d}"
+    result["软件版本日期"] = sw_date
+    pos += 3
+    
+    # 7. 电池容量: BCD, 4字节 (单位: mAh)
+    battery_bytes = data[pos:pos+4]
+    b1 = bcd_to_decimal(battery_bytes[0])
+    b2 = bcd_to_decimal(battery_bytes[1])
+    b3 = bcd_to_decimal(battery_bytes[2])
+    b4 = bcd_to_decimal(battery_bytes[3])
+    battery_capacity = f"{b1:02d}{b2:02d}{b3:02d}{b4:02d}"
+    result["电池容量"] = f"{battery_capacity} mAh"
+    pos += 4
+    
+    # 8. 支持的硬件模块信息: BIN, 4字节 (见设备类型TYPE定义, 表D.2)
+    hw_modules_bytes = data[pos:pos+4]
+    hw_modules_hex = hw_modules_bytes.hex().upper()
+    result["硬件模块信息"] = hw_modules_hex
+    # 按位解析模块 (表D.2)
+    byte0 = hw_modules_bytes[0]
+    modules = []
+    if byte0 & 0x01: modules.append("超高频RFID")
+    if byte0 & 0x02: modules.append("北斗模块")
+    if byte0 & 0x04: modules.append("保留")
+    if byte0 & 0x08: modules.append("保留")
+    if byte0 & 0x10: modules.append("热点")
+    if byte0 & 0x20: modules.append("SIM卡")
+    if byte0 & 0x40: modules.append("高频RFID")
+    if byte0 & 0x80: modules.append("激光红外")
+    result["支持的模块"] = ", ".join(modules) if modules else "无"
+    pos += 4
+    
+    # 9. 背夹交互自动关闭时间: HEX, 2字节 (低字节在前, 单位: 分)
+    # 如60min = 0x3C00 (小端: 00 3C)
+    auto_off_bytes = data[pos:pos+2]
+    auto_off_time = auto_off_bytes[0] + (auto_off_bytes[1] << 8)
+    result["自动关闭时间"] = f"{auto_off_time} 分钟"
+    pos += 2
+    
+    # 10. 厂商编码: HEX, 24字节
+    vendor_code = data[pos:pos+24].hex().upper()
+    result["厂商编码"] = vendor_code
+    pos += 24
+    
+    # 11. 厂家名称: GBK编码, 1+N (第一个字节表示长度)
+    if pos < len(data):
+        name_len = data[pos]
+        pos += 1
+        if pos + name_len <= len(data):
+            vendor_name_bytes = data[pos:pos+name_len]
+            try:
+                vendor_name = vendor_name_bytes.decode('gbk')
+                result["厂家名称"] = vendor_name
+            except:
+                result["厂家名称"] = vendor_name_bytes.hex().upper()
+    
+    return result
+
+def format_data_item(data: bytes, fmt: str) -> str:
+    """格式化数据项"""
+    if fmt == "ASCII":
+        return data.decode("ascii", errors="replace").rstrip("\x00 ").strip()
+    elif fmt == "HEX":
+        return " ".join(f"{b:02X}" for b in data)
+    elif fmt == "BIN":
+        if len(data) == 1: return str(data[0])
+        elif len(data) == 2: return str(int.from_bytes(data, "little"))
+        elif len(data) == 4: return str(int.from_bytes(data, "little"))
+        return " ".join(f"{b:02X}" for b in data)
+    elif fmt == "BCD":
+        if len(data) == 1: return str(((data[0] >> 4) & 0x0F) * 10 + (data[0] & 0x0F))
+        elif len(data) == 2: return f"V{data[0]:02X}.{data[1]:02X}"
+        return " ".join(f"{b:02X}" for b in data)
+    elif fmt == "BOOL_ON":
+        return "打开" if (len(data) == 1 and data[0] == 0x01) else "关闭"
+    elif fmt == "ERR_CODE":
+        if len(data) == 1: return ERR_CODE_MAP.get(data[0], f"未知(0x{data[0]:02X})")
+    return " ".join(f"{b:02X}" for b in data)
+
+# ============ 帧解析 ============
+def parse_hex_string(hex_str: str) -> bytes:
+    """解析十六进制字符串"""
+    hex_str = hex_str.strip()
+    hex_str = re.sub(r'[^0-9A-Fa-f]', '', hex_str)
+    if len(hex_str) % 2 != 0:
+        raise ValueError("十六进制字符串长度必须是偶数")
+    return bytes.fromhex(hex_str)
+
+def parse_frame(data: bytes) -> Tuple[Optional[Dict], Optional[str]]:
+    """
+    背夹协议帧解析
+    
+    帧格式: 97H | TYPE | ADDR(9) | LL | SEQ | C | Fn(2) | DATA | CS | END
+    - 固定部分: 18字节 (到DATA结束)
+    - CS: 倒数第2字节
+    - END: 最后1字节
+    - CS = sum(所有字节从0到DATA结束)
+    """
+    if len(data) < 18:
+        return None, f"数据太短: 需要至少18字节, 实际{len(data)}字节"
+
+    if data[0] != 0x97:
+        return None, f"帧起始错误: 期望97H, 实际{data[0]:02X}H"
+
+    # 字段位置
+    # Byte 0: 97 (起始)
+    # Byte 1: TYPE
+    # Bytes 2-7: MAC (6字节)
+    # Bytes 8-10: COMM (3字节)
+    # Byte 11: LL (数据长度)
+    # Byte 12: SEQ
+    # Byte 13: C (控制域)
+    # Byte 14: (保留/填充)
+    # Byte 15: 可能是填充
+    # Byte 16: F0 (0xB0)
+    # Byte 17: F1 (0x01)
+    # Byte 18+: DATA
+    # 倒数第2: CS
+    # 最后1: END
+
+    typ = data[1]
+    mac = data[2:8]
+    comm = data[8:11]
+    ll = data[11]
+    seq = data[12]
+    ctrl_byte = data[13]
+    # 经过分析，用户帧结构:
+    # bytes 0-17: 固定部分+Fn (18字节)
+    # byte 18: CS (校验和)
+    # byte 19: END (结束符)
+    # 数据: bytes 17 (F1位置, 0x01) 作为功能码的一部分
+    
+    f0 = data[16]  # 0xB0 = 背夹功能
+    f1 = data[17]  # 0x01 = 获取背夹信息
+
+    # CS位置: 倒数第2字节
+    cs_pos = len(data) - 2
+    end_pos = len(data) - 1
+    
+    # 数据单元: 从固定部分结束后到CS前
+    # 固定部分 = bytes 0-17 (18字节: 到F1结束)
+    # 数据 = bytes 18到cs_pos-1
+    fixed_data_end = 18  # bytes 0-17 = 18字节
+    du = data[fixed_data_end:cs_pos]
+
+    # CS校验
+    cs_calc = sum(data[0:cs_pos]) & 0xFF
+    cs_rcv = data[cs_pos]
+    end = data[end_pos]
+
+    # 组装结果
+    # 解析数据单元
+    data_unit_parsed = parse_data_unit(f0, f1, du)
+
+    result = {
+        "frame_start": f"{data[0]:02X}H",
+        "dev_type": typ,
+        "dev_type_name": TYPE_MAP.get(typ, f"未知(0x{typ:02X})"),
+        "addr_mac": ":".join(f"{b:02X}" for b in mac),
+        "addr_comm": ":".join(f"{b:02X}" for b in comm),
+        "data_len": ll,
+        "seq": seq,
+        "control": decode_control(ctrl_byte),
+        "f0": f0,
+        "f1": f1,
+        "fn_name": get_fn_name(f0, f1),
+        "fn_raw": f"{f0:02X}{f1:02X}H",
+        "data_unit_raw": " ".join(f"{b:02X}" for b in du),
+        "data_unit": du,
+        "data_unit_parsed": data_unit_parsed,
+        "cs": {"received": f"{cs_rcv:02X}H", "calculated": f"{cs_calc:02X}H", "valid": cs_calc == cs_rcv},
+        "end": f"{end:02X}H",
+        "is_error_response": decode_control(ctrl_byte)["is_error"],
+    }
+
+    return result, None
+
+def format_result_text(result: Dict) -> str:
+    """格式化输出解析结果"""
+    ctrl = result["control"]
+    lines = []
+    lines.append("=" * 60)
+    lines.append("  背夹通信协议报文解析结果")
+    lines.append("=" * 60)
+    lines.append(f"\n【帧头】")
+    lines.append(f"  帧起始:     {result['frame_start']}")
+    lines.append(f"  TYPE:       {result['dev_type']:02X}H -> {result['dev_type_name']}")
+    lines.append(f"  MAC:        {result['addr_mac']}")
+    lines.append(f"  通信地址:   {result['addr_comm']}")
+    lines.append(f"  数据长度:   {result['data_len']} (LL字段)")
+    lines.append(f"  SEQ:        {result['seq']:02X}H ({result['seq']})")
+    lines.append(f"  控制域C:    {ctrl['raw']}")
+    lines.append(f"    传输方向: {ctrl['dir']}")
+    lines.append(f"    主从站:   {ctrl['prm']}")
+    lines.append(f"    加密:     {'是' if ctrl['encrypted'] else '否'}")
+    lines.append(f"    后续帧:   {'是' if ctrl['follow_up'] else '否'}")
+    lines.append(f"    错误:     {'异常' if ctrl['is_error'] else '正常'}")
+    lines.append(f"\n【功能码】")
+    lines.append(f"  Fn:         {result['fn_raw']}")
+    lines.append(f"  功能:       {result['fn_name']}")
+    lines.append(f"\n【数据单元】")
+    lines.append(f"  原始数据:   {result['data_unit_raw']}")
+    lines.append(f"  实际长度:   {len(result['data_unit'])} 字节")
+    # 显示解析后的数据
+    parsed = result.get('data_unit_parsed', {})
+    if parsed and 'raw' not in parsed:
+        for key, value in parsed.items():
+            lines.append(f"  {key}:     {value}")
+    lines.append(f"\n【帧尾】")
+    cs = result["cs"]
+    lines.append(f"  校验CS:     {cs['received']} (计算: {cs['calculated']}) {'OK' if cs['valid'] else 'FAIL'}")
+    lines.append(f"  结束符:     {result['end']}")
+    lines.append("\n" + "=" * 60)
+    return "\n".join(lines)
+
+# ============ 主函数 ============
+if __name__ == "__main__":
+    import sys
+    # 测试用户帧
+    hex_str = "97FFFFFFFFAAAAAAAAAAAA9700000340B0011AE9"
+    data = bytes.fromhex(hex_str)
+    print(f"输入: {hex_str}\n")
+    result, err = parse_frame(data)
+    if err:
+        print(f"错误: {err}")
+    else:
+        print(format_result_text(result))
