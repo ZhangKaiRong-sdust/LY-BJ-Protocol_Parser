@@ -175,8 +175,10 @@ def decode_control(control_byte: int) -> Dict[str, Any]:
 
     if direction == 0 and prm == 1:
         frame_kind = "主站请求"
-    elif direction == 1 and prm == 0:
-        frame_kind = "从站应答"
+    elif direction == 1 and prm == 0 and error == 0:
+        frame_kind = "从站正常应答"
+    elif direction == 1 and prm == 0 and error == 1:
+        frame_kind = "从站异常应答"
     elif direction == 1 and prm == 1:
         frame_kind = "从站主动上报"
     elif direction == 0 and prm == 0:
@@ -194,6 +196,7 @@ def decode_control(control_byte: int) -> Dict[str, Any]:
         "frame_kind": frame_kind,
         "is_request": direction == 0 and prm == 1,
         "is_response": direction == 1 and prm == 0,
+        "is_normal_response": direction == 1 and prm == 0 and error == 0,
         "is_error_response": direction == 1 and prm == 0 and error == 1,
     }
 
@@ -213,6 +216,16 @@ def module_type_name(module_type: int) -> str:
 
 def error_name(error_code: int) -> str:
     return BACKCLIP_ERROR_MAP.get(error_code, f"未知错误(0x{error_code:02X})")
+
+
+def append_kv_block(lines: List[str], title: str, rows: List[Tuple[str, Any]]) -> None:
+    lines.append(title)
+    if not rows:
+        lines.append("  (空)")
+        return
+
+    for label, value in rows:
+        lines.append(f"  {label}\t: {value}")
 
 
 def parse_device_status(data: bytes) -> Dict[str, Any]:
@@ -445,6 +458,10 @@ def parse_data_unit(f0: int, f1: int, data: bytes, control: Dict[str, Any]) -> D
         return parse_error_payload(f0, f1, data)
 
     if not data:
+        if control["is_normal_response"]:
+            return {"说明": "该报文为从站正常应答帧，无数据单元"}
+        if control["is_request"]:
+            return {"说明": "该报文为主站请求帧，无数据单元"}
         return {"说明": "无数据单元"}
 
     if f0 == 0x01 and f1 == 0x02:
@@ -548,52 +565,74 @@ def format_result_text(result: Dict[str, Any]) -> str:
     lines: List[str] = []
 
     lines.append("=" * 72)
-    lines.append("  背夹通信协议报文解析结果")
+    lines.append(" 背夹通信协议报文解析结果")
     lines.append("=" * 72)
 
     lines.append("")
-    lines.append("【帧头】")
-    lines.append(f"  起始符:           {result['frame_start']}")
-    lines.append(f"  设备功能TYPE:     {result['device_type_raw']} ({result['device_type_display']})")
-    lines.append(f"  MAC(原始传输序):  {result['mac_raw_order']}")
-    lines.append(f"  MAC(常规显示):    {result['mac_display']}")
-    lines.append(f"  帧头分隔符:       {result['frame_split']}")
-    lines.append(f"  数据域长度L:      {result['data_len']} 字节 ({result['length_raw']}, 小端)")
-    lines.append(f"  帧序号SEQ:        {result['seq']:02X}H ({result['seq']})")
+    append_kv_block(
+        lines,
+        "【帧头】",
+        [
+            ("起始符", result["frame_start"]),
+            ("设备功能 TYPE", f"{result['device_type_raw']} ({result['device_type_display']})"),
+            ("MAC(原始传输序)", result["mac_raw_order"]),
+            ("MAC(常规显示)", result["mac_display"]),
+            ("帧头分隔符", result["frame_split"]),
+            ("数据域长度 L", f"{result['data_len']} 字节 ({result['length_raw']}, 小端)"),
+            ("帧序号 SEQ", f"{result['seq']:02X}H ({result['seq']})"),
+        ],
+    )
 
     lines.append("")
-    lines.append("【控制码】")
-    lines.append(f"  C:                {control['raw']}")
-    lines.append(f"  帧类型:           {control['frame_kind']}")
-    lines.append(f"  发送方向:         {control['direction']}")
-    lines.append(f"  主从角色:         {control['prm']}")
-    lines.append(f"  异常应答:         {'是' if control['error'] else '否'}")
-    lines.append(f"  是否加密:         {'是' if control['encrypted'] else '否'}")
-    lines.append(f"  保留位(D3-D0):    0x{control['reserved_low_nibble']:X}")
+    append_kv_block(
+        lines,
+        "【控制码】",
+        [
+            ("C", control["raw"]),
+            ("帧类型", control["frame_kind"]),
+            ("发送方向", control["direction"]),
+            ("主从角色", control["prm"]),
+            ("异常应答", "是" if control["error"] else "否"),
+            ("是否加密", "是" if control["encrypted"] else "否"),
+            ("保留位(D3-D0)", f"0x{control['reserved_low_nibble']:X}"),
+        ],
+    )
 
     lines.append("")
-    lines.append("【功能码】")
-    lines.append(f"  Fn:               {result['fn_raw']}")
-    lines.append(f"  功能定义:         {result['fn_name']}")
+    append_kv_block(
+        lines,
+        "【功能码】",
+        [
+            ("Fn", result["fn_raw"]),
+            ("功能定义", result["fn_name"]),
+        ],
+    )
 
     lines.append("")
-    lines.append("【数据单元】")
-    lines.append(f"  原始数据:         {result['data_unit_raw'] or '(空)'}")
-    lines.append(f"  实际长度:         {len(result['data_unit'])} 字节")
+    data_rows: List[Tuple[str, Any]] = [
+        ("原始数据", result["data_unit_raw"] or "(空)"),
+        ("实际长度", f"{len(result['data_unit'])} 字节"),
+    ]
 
     parsed = result.get("data_unit_parsed", {})
     if parsed:
         for key, value in parsed.items():
-            lines.append(f"  {key}:         {value}")
+            data_rows.append((key, value))
+    append_kv_block(lines, "【数据单元】", data_rows)
 
     lines.append("")
-    lines.append("【帧尾】")
-    lines.append(
-        f"  校验CS:           {result['cs']['received']} "
-        f"(计算: {result['cs']['calculated']}) "
-        f"{'OK' if result['cs']['valid'] else 'FAIL'}"
+    append_kv_block(
+        lines,
+        "【帧尾】",
+        [
+            (
+                "校验CS",
+                f"{result['cs']['received']} (计算: {result['cs']['calculated']}) "
+                f"{'OK' if result['cs']['valid'] else 'FAIL'}",
+            ),
+            ("结束符", result["end"]),
+        ],
     )
-    lines.append(f"  结束符:           {result['end']}")
 
     warnings = result.get("warnings") or []
     if warnings:
